@@ -21,7 +21,7 @@
 # for a kubernetes node image, it doesn't contain much (anything?) we don't need
 # this stage will install basic files and packages
 ARG BASE_IMAGE=debian:bookworm-slim
-FROM $BASE_IMAGE as base
+FROM $BASE_IMAGE AS base
 
 # copy in static files
 # all scripts and directories are 0755 (rwx r-x r-x)
@@ -73,7 +73,7 @@ RUN chmod 755 /kind/bin && \
     echo "Installing Packages ..." \
     && DEBIAN_FRONTEND=noninteractive clean-install \
       systemd \
-      conntrack iptables iproute2 ethtool util-linux mount ebtables kmod \
+      conntrack iptables nftables iproute2 ethtool util-linux mount kmod \
       libseccomp2 pigz fuse-overlayfs \
       nfs-common open-iscsi \
       bash ca-certificates curl jq procps \
@@ -102,7 +102,7 @@ RUN echo "Ensuring /etc/kubernetes/manifests" \
 # This is also why we start again FROM the same base image but a different
 # platform and only the files needed for building
 # We will copy the built binaries from later stages to the final stage(s)
-FROM --platform=$BUILDPLATFORM $BASE_IMAGE as go-build
+FROM --platform=$BUILDPLATFORM $BASE_IMAGE AS go-build
 COPY --chmod=0755 files/usr/local/bin/* /usr/local/bin/
 COPY --chmod=0755 scripts/third_party/gimme/gimme /usr/local/bin/
 COPY --chmod=0755 scripts/target-cc /usr/local/bin/
@@ -115,13 +115,14 @@ RUN dpkg --add-architecture arm64 && dpkg --add-architecture amd64 \
 # set by makefile to .go-version
 ARG GO_VERSION
 RUN eval "$(gimme "${GO_VERSION}")" \
+    && export GOTOOLCHAIN="go${GO_VERSION}" \
     && GOBIN=/usr/local/bin go install github.com/google/go-licenses@latest
 
 
 # stage for building containerd
-FROM go-build as build-containerd
+FROM go-build AS build-containerd
 ARG TARGETARCH GO_VERSION
-ARG CONTAINERD_VERSION="v1.7.13"
+ARG CONTAINERD_VERSION="v1.7.18"
 ARG CONTAINERD_CLONE_URL="https://github.com/containerd/containerd"
 # we don't build with optional snapshotters, we never select any of these
 # they're not ideal inside kind anyhow, and we save some disk space
@@ -130,46 +131,50 @@ RUN git clone --filter=tree:0 "${CONTAINERD_CLONE_URL}" /containerd \
     && cd /containerd \
     && git checkout "${CONTAINERD_VERSION}" \
     && eval "$(gimme "${GO_VERSION}")" \
+    && export GOTOOLCHAIN="go${GO_VERSION}" \
     && export GOARCH=$TARGETARCH && export CC=$(target-cc) && export CGO_ENABLED=1 \
     && make bin/ctr bin/containerd bin/containerd-shim-runc-v2 \
     && GOARCH=$TARGETARCH go-licenses save --save_path=/_LICENSES \
         ./cmd/ctr ./cmd/containerd ./cmd/containerd-shim-runc-v2
 
 # stage for building runc
-FROM go-build as build-runc
+FROM go-build AS build-runc
 ARG TARGETARCH GO_VERSION
-ARG RUNC_VERSION="v1.1.12"
+ARG RUNC_VERSION="v1.1.13"
 ARG RUNC_CLONE_URL="https://github.com/opencontainers/runc"
 RUN git clone --filter=tree:0 "${RUNC_CLONE_URL}" /runc \
     && cd /runc \
     && git checkout "${RUNC_VERSION}" \
     && eval "$(gimme "${GO_VERSION}")" \
+    && export GOTOOLCHAIN="go${GO_VERSION}" \
     && export GOARCH=$TARGETARCH && export CC=$(target-cc) && export CGO_ENABLED=1 \
     && make runc \
     && GOARCH=$TARGETARCH go-licenses save --save_path=/_LICENSES .
 
 # stage for building crictl
-FROM go-build as build-crictl
+FROM go-build AS build-crictl
 ARG TARGETARCH GO_VERSION
 ARG CRI_TOOLS_CLONE_URL="https://github.com/kubernetes-sigs/cri-tools"
-ARG CRICTL_VERSION="v1.28.0"
+ARG CRICTL_VERSION="v1.30.0"
 RUN git clone --filter=tree:0 "${CRI_TOOLS_CLONE_URL}" /cri-tools \
     && cd /cri-tools \
     && git checkout "${CRICTL_VERSION}" \
     && eval "$(gimme "${GO_VERSION}")" \
+    && export GOTOOLCHAIN="go${GO_VERSION}" \
     && export GOARCH=$TARGETARCH && export CC=$(target-cc) && export CGO_ENABLED=1 \
     && make BUILD_BIN_PATH=./build crictl \
     && GOARCH=$TARGETARCH go-licenses save --save_path=/_LICENSES ./cmd/crictl
 
 # stage for building cni-plugins
-FROM go-build as build-cni
+FROM go-build AS build-cni
 ARG TARGETARCH GO_VERSION
-ARG CNI_PLUGINS_VERSION="v1.3.0"
+ARG CNI_PLUGINS_VERSION="v1.5.1"
 ARG CNI_PLUGINS_CLONE_URL="https://github.com/containernetworking/plugins"
 RUN git clone --filter=tree:0 "${CNI_PLUGINS_CLONE_URL}" /cni-plugins \
     && cd /cni-plugins \
     && git checkout "${CNI_PLUGINS_VERSION}" \
     && eval "$(gimme "${GO_VERSION}")" \
+    && export GOTOOLCHAIN="go${GO_VERSION}" \
     && mkdir ./bin \
     && export GOARCH=$TARGETARCH && export CC=$(target-cc) && export CGO_ENABLED=1 \
     && go build -o ./bin/host-local -mod=vendor ./plugins/ipam/host-local \
@@ -182,21 +187,22 @@ RUN git clone --filter=tree:0 "${CNI_PLUGINS_CLONE_URL}" /cni-plugins \
         ./plugins/meta/portmap
 
 # stage for building containerd-fuse-overlayfs
-FROM go-build as build-fuse-overlayfs
+FROM go-build AS build-fuse-overlayfs
 ARG TARGETARCH GO_VERSION
-ARG CONTAINERD_FUSE_OVERLAYFS_VERSION="v1.0.6"
+ARG CONTAINERD_FUSE_OVERLAYFS_VERSION="v1.0.8"
 ARG CONTAINERD_FUSE_OVERLAYFS_CLONE_URL="https://github.com/containerd/fuse-overlayfs-snapshotter"
 RUN git clone --filter=tree:0 "${CONTAINERD_FUSE_OVERLAYFS_CLONE_URL}" /fuse-overlayfs-snapshotter \
     && cd /fuse-overlayfs-snapshotter \
     && git checkout "${CONTAINERD_FUSE_OVERLAYFS_VERSION}" \
     && eval "$(gimme "${GO_VERSION}")" \
+    && export GOTOOLCHAIN="go${GO_VERSION}" \
     && export GOARCH=$TARGETARCH && export CC=$(target-cc) && export CGO_ENABLED=1 \
     && make bin/containerd-fuse-overlayfs-grpc \
     && GOARCH=$TARGETARCH go-licenses save --save_path=/_LICENSES ./cmd/containerd-fuse-overlayfs-grpc
 
 
 # build final image layout from other stages
-FROM base as build
+FROM base AS build
 # copy over containerd build and install
 COPY --from=build-containerd /containerd/bin/containerd /usr/local/bin/
 COPY --from=build-containerd /containerd/bin/ctr /usr/local/bin/
@@ -231,7 +237,7 @@ COPY --from=build / /
 # add metadata, must be done after the squashing
 # first tell systemd that it is in docker (it will check for the container env)
 # https://systemd.io/CONTAINER_INTERFACE/
-ENV container docker
+ENV container=docker
 # systemd exits on SIGRTMIN+3, not SIGTERM (which re-executes it)
 # https://bugzilla.redhat.com/show_bug.cgi?id=1201657
 STOPSIGNAL SIGRTMIN+3
