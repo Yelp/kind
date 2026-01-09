@@ -1,4 +1,4 @@
-name: Podman
+name: Nerdctl
 
 on:
   workflow_dispatch:
@@ -12,9 +12,9 @@ permissions:
   contents: read
 
 jobs:
-  podman:
-    name: Podman
-    runs-on: ubuntu-20.04
+  nerdctl:
+    name: Nerdctl
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -24,10 +24,10 @@ jobs:
         exclude:
           - ipFamily: ipv6
     env:
-      JOB_NAME: "podman-${{ matrix.deployment }}-${{ matrix.ipFamily }}"
-      KIND_EXPERIMENTAL_PROVIDER: "podman"
+      JOB_NAME: "nerdctl-${{ matrix.deployment }}-${{ matrix.ipFamily }}"
       IP_FAMILY: ${{ matrix.ipFamily }}
-      PODMAN_VERSION: "stable"
+      NERDCTL_VERSION: "1.7.4"
+      KIND_EXPERIMENTAL_PROVIDER: "nerdctl"
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
@@ -48,42 +48,35 @@ jobs:
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
           sudo sysctl -w net.ipv4.ip_forward=1
 
-      - name: Setup podman
+      - name: Install nerdctl
         run: |
-          podman version
-          # podman requires dnsmasq for custom networks
-          # https://github.com/actions/virtual-environments/issues/2708
-          sudo apt-get update
-          sudo apt-get -y install dnsmasq
-          # crun >= 1.9.1 is required on Ubuntu 20.04.6
-          # https://github.com/kubernetes-sigs/kind/issues/3526
-          curl -Lo ./crun https://github.com/containers/crun/releases/download/1.14.3/crun-1.14.3-linux-amd64
-          chmod +x ./crun
-          sudo mv ./crun /usr/bin/crun
+          # Remove Docker and Podman
+          sudo systemctl is-active --quiet docker.service || systemctl stop docker.service
+          sudo apt-get remove -y docker-ce docker-ce-cli podman containerd.io
+          sudo rm -rf /etc/systemd/system/containerd.service # clean up the cotnainerd systemd file
+          # Install nerdctl full package
+          sudo curl -sSL https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-full-${NERDCTL_VERSION}-linux-amd64.tar.gz | sudo tar -xvz -C /usr/local
+          # Start Containerd
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now containerd
+          # Show Versions
+          sudo ctr version
+          sudo nerdctl version
 
       - name: Create single node cluster
         if: ${{ matrix.deployment == 'singleNode' }}
         run: |
-          cat <<EOF | sudo KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster -v7 --wait 1m --retain --config=-
+          cat <<EOF | sudo /usr/local/bin/kind create cluster -v7 --wait 1m --retain --config=-
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
           networking:
             ipFamily: ${IP_FAMILY}
-          nodes:
-          - role: control-plane
-            extraPortMappings:
-            - containerPort: 80
-              hostPort: 80
-              listenAddress: 0.0.0.0
-            - containerPort: 443
-              hostPort: 443
-              listenAddress: 0.0.0.0
           EOF
 
       - name: Create multi node cluster
         if: ${{ matrix.deployment == 'multiNode' }}
         run: |
-          cat <<EOF | sudo KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster -v7 --wait 1m --retain --config=-
+          cat <<EOF | sudo /usr/local/bin/kind create cluster -v7 --wait 1m --retain --config=-
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
           networking:
@@ -101,16 +94,20 @@ jobs:
           sudo kubectl get nodes -o wide
           sudo kubectl get pods -A
 
-        # TODO: implement this
-      - name: Load docker image
-        run: sudo KIND_EXPERIMENTAL_PROVIDER=podman kind load docker-image busybox:2
+      # TODO: similar to podman, this fails because the imageID() code in KinD is hardcoded to run a docker command
+      # need to solve this code before this test will work properly
+      - name: Load nerdctl image
+        run: |
+          sudo nerdctl pull busybox
+          sudo /usr/local/bin/kind load docker-image busybox
         continue-on-error: true
 
       - name: Export logs
         if: always()
         run: |
-          mkdir -p /tmp/kind/logs
-          sudo KIND_EXPERIMENTAL_PROVIDER=podman kind export logs /tmp/kind/logs
+          sudo cat /etc/cni/net.d/* 
+          sudo mkdir -p /tmp/kind/logs
+          sudo /usr/local/bin/kind export logs /tmp/kind/logs
           sudo chown -R $USER:$USER /tmp/kind/logs
 
       - name: Upload logs
@@ -121,4 +118,4 @@ jobs:
           path: /tmp/kind/logs
 
       - name: Delete cluster
-        run: sudo KIND_EXPERIMENTAL_PROVIDER=podman kind delete cluster
+        run: sudo /usr/local/bin/kind delete cluster
