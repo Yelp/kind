@@ -284,7 +284,13 @@ func isPoolOverlapError(err error) bool {
 
 func isNetworkAlreadyExistsError(err error) bool {
 	rerr := exec.RunErrorForError(err)
-	return rerr != nil && strings.HasPrefix(string(rerr.Output), "Error response from daemon: network with name") && strings.Contains(string(rerr.Output), "already exists")
+	if rerr == nil {
+		return false
+	}
+	output := string(rerr.Output)
+	return strings.Contains(output, "already exists") &&
+		(strings.HasPrefix(output, "Error response from daemon: network with name") ||
+			strings.HasPrefix(output, "Error response from daemon: network name"))
 }
 
 // returns true if:
