@@ -33,6 +33,7 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	golang.org/x/sys v0.6.0 // indirect
+	sigs.k8s.io/kind v0.31.0 // indirect
 )
 
 replace sigs.k8s.io/kind => ./
