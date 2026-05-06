@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 
@@ -29,7 +30,6 @@ import (
 	"sigs.k8s.io/kind/pkg/exec"
 	"sigs.k8s.io/kind/pkg/log"
 
-	internallogs "sigs.k8s.io/kind/pkg/cluster/internal/logs"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers/common"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
@@ -40,9 +40,21 @@ import (
 
 // NewProvider returns a new provider based on executing `nerdctl ...`
 func NewProvider(logger log.Logger, binaryName string) providers.Provider {
-	// if unset, default to nerdctl
+	// if binaryName is unset, do a lookup; we may be here via a
+	// library call to provider.DetectNodeProvider(), which returns
+	// true from nerdctl.IsAvailable() by checking for both finch
+	// and nerdctl. If we don't redo the lookup here, then a finch
+	// install that triggered IsAvailable() to be true would fail
+	// to be used if we default to nerdctl when unset.
 	if binaryName == "" {
+		// default to "nerdctl"; but look for "finch" if
+		// nerctl binary lookup fails
 		binaryName = "nerdctl"
+		if _, err := osexec.LookPath("nerdctl"); err != nil {
+			if _, err := osexec.LookPath("finch"); err == nil {
+				binaryName = "finch"
+			}
+		}
 	}
 	return &provider{
 		logger:     logger,
@@ -94,7 +106,14 @@ func (p *provider) Provision(status *cli.Status, cfg *config.Cluster) (err error
 	}
 
 	// actually create nodes
-	return errors.UntilErrorConcurrent(createContainerFuncs)
+	// TODO: remove once nerdctl handles concurrency better
+	// xref: https://github.com/containerd/nerdctl/issues/2908
+	for _, f := range createContainerFuncs {
+		if err := f(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ListClusters is part of the providers.Provider interface
@@ -105,7 +124,7 @@ func (p *provider) ListClusters() ([]string, error) {
 		// filter for nodes with the cluster label
 		"--filter", "label="+clusterLabelKey,
 		// format to include the cluster name
-		"--format", fmt.Sprintf(`{{index .Labels "%s"}}`, clusterLabelKey),
+		"--format", fmt.Sprintf(`{{.Label "%s"}}`, clusterLabelKey),
 	)
 	lines, err := exec.OutputLines(cmd)
 	if err != nil {
@@ -282,34 +301,17 @@ func (p *provider) CollectLogs(dir string, nodes []nodes.Node) error {
 			filepath.Join(dir, "docker-info.txt"),
 		),
 	}
-
-	// collect /var/log for each node and plan collecting more logs
-	var errs []error
+	// inspect each node
 	for _, n := range nodes {
 		node := n // https://golang.org/doc/faq#closures_and_goroutines
 		name := node.String()
 		path := filepath.Join(dir, name)
-		if err := internallogs.DumpDir(p.logger, node, "/var/log", path); err != nil {
-			errs = append(errs, err)
-		}
-
 		fns = append(fns,
-			func() error { return common.CollectLogs(node, path) },
 			execToPathFn(exec.Command(p.Binary(), "inspect", name), filepath.Join(path, "inspect.json")),
-			func() error {
-				f, err := common.FileOnHost(filepath.Join(path, "serial.log"))
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-				return node.SerialLogs(f)
-			},
 		)
 	}
-
 	// run and collect up all errors
-	errs = append(errs, errors.AggregateConcurrent(fns))
-	return errors.NewAggregate(errs)
+	return errors.AggregateConcurrent(fns)
 }
 
 // Info returns the provider info.
